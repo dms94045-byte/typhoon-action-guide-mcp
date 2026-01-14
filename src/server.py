@@ -13,12 +13,15 @@ from .geo_kr import geocode_korea
 from .utils import TTLCache, haversine_km
 
 
+# -----------------------------
+# 내부 유틸
+# -----------------------------
 def _parse_date_yyyymmdd(s: str) -> date:
     return datetime.strptime(s, "%Y%m%d").date()
 
 
 def _fmt_dt14_kst(typ_tm: str) -> str:
-    # data.go.kr는 KST 기준이 섞여 있을 수 있고, typTm는 YYYYMMDDHHMM 형태
+    # typTm: YYYYMMDDHHMM 형태가 일반적
     try:
         dt = datetime.strptime(typ_tm, "%Y%m%d%H%M")
         return dt.strftime("%Y-%m-%d %H:%M")
@@ -33,7 +36,7 @@ def _pick_most_relevant_typhoon(typhoons: List[Dict[str, Any]]) -> Optional[Dict
 def _summarize_track_near_location(
     points: List[Dict[str, Any]], loc_lat: float, loc_lon: float
 ) -> Dict[str, Any]:
-    # 가장 가까운 지점과 그 시각을 찾고, 근접 전후 시간을 '영향 가능 시간대'로 제공
+    # 가장 가까운 지점과 근접 시간대(±6시간)를 추정
     best = None
     for p in points:
         dist = haversine_km(loc_lat, loc_lon, p["lat"], p["lon"])
@@ -43,7 +46,6 @@ def _summarize_track_near_location(
     if best is None:
         return {"closest": None, "impact_window": None}
 
-    # 근접 시각 +/- 6시간을 임시 영향 가능 시간대로 제안(정밀 예보 대체가 아님)
     typ_tm = best["p"].get("typTm", "")
     try:
         dt = datetime.strptime(typ_tm, "%Y%m%d%H%M")
@@ -68,8 +70,9 @@ def _summarize_track_near_location(
     return {"closest": closest, "impact_window": window}
 
 
-# ---------- MCP 서버 ----------
-
+# -----------------------------
+# MCP 서버 세팅
+# -----------------------------
 cache = TTLCache(int(os.getenv("CACHE_TTL_SECONDS", "120")))
 _data_client = None
 
@@ -85,6 +88,9 @@ def _get_data_client():
 mcp = FastMCP(name="TyphoonActionGuide", stateless_http=True)
 
 
+# -----------------------------
+# Tools
+# -----------------------------
 @mcp.tool(
     description="최근(기본: 최근 3일~내일) 기준으로 현재/근접 태풍의 요약과 사용자의 지역 기준 영향 가능 시간대를 반환합니다."
 )
@@ -95,7 +101,7 @@ async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, 
         return {
             "has_active_typhoon": None,
             "error": str(e),
-            "hint": "DATA_GO_KR_SERVICE_KEY를 .env에 설정하세요.",
+            "hint": "DATA_GO_KR_SERVICE_KEY를 .env(Environment)에 설정하세요.",
         }
 
     from_d, to_d = default_recent_range(3, 1)
@@ -111,7 +117,7 @@ async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, 
     t = _pick_most_relevant_typhoon(typhoons)
     typ_seq = int(t.get("typSeq", 0))
 
-    # track point는 발표 기반이므로 최근 7일 정도로 확장해서 탐색
+    # track point는 발표 기반이므로 최근 7일~+2일 정도로 확장
     pts = await data_client.get_track_points(
         typ_seq=typ_seq,
         from_d=date.today() - timedelta(days=7),
@@ -123,7 +129,6 @@ async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, 
     if loc and pts:
         near = _summarize_track_near_location(pts, loc_lat=loc[0], loc_lon=loc[1])
 
-    # 최신 포인트
     last = pts[-1] if pts else None
 
     return {
@@ -154,7 +159,7 @@ async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, 
         },
         "proximity": near,
         "data_range_used": {"from": str(from_d), "to": str(to_d)},
-        "disclaimer": "이 도구는 통보문 기반 좌표를 이용해 '근접 시각'을 단순 추정합니다. 정확한 상륙/통과 시각은 기상청 최신 태풍정보/특보를 함께 확인하세요.",
+        "disclaimer": "이 도구는 통보문 기반 좌표로 근접 시각을 단순 추정합니다. 정확한 상륙/통과 시각은 기상청 최신 태풍정보/특보를 함께 확인하세요.",
     }
 
 
@@ -163,7 +168,7 @@ async def search_past_typhoons(query: str, year: Optional[int] = None) -> Dict[s
     try:
         data_client = _get_data_client()
     except Exception as e:
-        return {"ok": False, "error": str(e), "hint": "DATA_GO_KR_SERVICE_KEY를 .env에 설정하세요."}
+        return {"ok": False, "error": str(e), "hint": "DATA_GO_KR_SERVICE_KEY를 .env(Environment)에 설정하세요."}
 
     q = (query or "").strip()
     if not q and year is None:
@@ -177,6 +182,7 @@ async def search_past_typhoons(query: str, year: Optional[int] = None) -> Dict[s
         from_d = date(y, 1, 1)
         to_d = date(y, 12, 31)
         typhoons = await data_client.list_unique_typhoons_in_range(from_d, to_d)
+
         for t in typhoons:
             name_kr = str(t.get("typName", ""))
             name_en = str(t.get("typEn", ""))
@@ -187,16 +193,13 @@ async def search_past_typhoons(query: str, year: Optional[int] = None) -> Dict[s
                 matches.append(t)
 
         if matches and year is None:
-            # 검색어가 있으면 우선 연도에서 찾는 즉시 중단
             break
-
-    matches = matches[:20]
 
     return {
         "ok": True,
         "query": q,
         "year": year,
-        "results": matches,
+        "results": matches[:20],
         "hint": "결과의 typSeq(태풍번호)로 get_past_typhoon_track을 호출하면 경로 포인트를 받을 수 있습니다.",
     }
 
@@ -208,7 +211,7 @@ async def get_past_typhoon_track(
     try:
         data_client = _get_data_client()
     except Exception as e:
-        return {"ok": False, "error": str(e), "hint": "DATA_GO_KR_SERVICE_KEY를 .env에 설정하세요."}
+        return {"ok": False, "error": str(e), "hint": "DATA_GO_KR_SERVICE_KEY를 .env(Environment)에 설정하세요."}
 
     if typSeq <= 0:
         return {"ok": False, "message": "typSeq는 1 이상의 정수여야 합니다."}
@@ -217,13 +220,11 @@ async def get_past_typhoon_track(
         from_d = _parse_date_yyyymmdd(from_yyyymmdd)
         to_d = _parse_date_yyyymmdd(to_yyyymmdd)
     else:
-        # 기본: 최근 30일~내일 범위에서 우선 찾고, 없으면 최근 10년을 넓게 탐색
         from_d, to_d = default_recent_range(30, 1)
 
     pts = await data_client.get_track_points(typ_seq=typSeq, from_d=from_d, to_d=to_d)
 
     if not pts and (not (from_yyyymmdd and to_yyyymmdd)):
-        # fallback: 최근 10년 훑기(너무 길어지지 않도록 10년 제한)
         today = date.today()
         for y in range(today.year, today.year - 9, -1):
             pts = await data_client.get_track_points(
@@ -245,29 +246,33 @@ async def get_past_typhoon_track(
 
 @mcp.prompt()
 def typhoon_action_guide_system_prompt() -> str:
-    # 배포/제출용으로 prompts/system_prompt.txt의 동일 내용을 반환해도 됨.
-    return """태풍 대응 행동 가이드 MCP: 시스템 프롬프트는 prompts/system_prompt.txt 파일을 참고하세요."""
+    # 필요하면 prompts/system_prompt.txt 내용을 그대로 반환하도록 바꿔도 됨
+    return "태풍 대응 행동 가이드 MCP: 프롬프트는 프로젝트의 prompts/system_prompt.txt 기준으로 운용합니다."
 
 
-# ---------- ASGI 앱 ----------
-
+# -----------------------------
+# ASGI 앱
+# -----------------------------
 def create_app() -> FastAPI:
-    # redirect_slashes=False: /mcp 와 /mcp/ 간 307 리다이렉트로 인한 연결 실패를 피하기 위함
+    """
+    ✅ PlayMCP 호환 핵심:
+    - PlayMCP는 입력한 Endpoint(루트)를 기준으로 내부에서 /mcp 로 호출함
+    - 따라서 MCP 앱을 '/mcp'에 붙이지 말고, '루트(/)'에 붙여야 함
+    """
     app = FastAPI(
         title="Typhoon Action Guide MCP",
         redirect_slashes=False,
         lifespan=lambda app: mcp.session_manager.run(),
     )
 
-    # ✅ 브라우저 기반 PlayMCP 호출 대비: CORS + OPTIONS 프리플라이트 허용
-    # (데모/제출용) allow_origins=["*"] 로 두고, 운영 시 특정 도메인만 허용 권장
+    # ✅ CORS (PlayMCP는 웹에서 호출하므로 필수)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["*"],  # Mcp-Session-Id 같은 헤더 노출에 도움
+        expose_headers=["*"],
         max_age=86400,
     )
 
@@ -275,10 +280,8 @@ def create_app() -> FastAPI:
     def health() -> Dict[str, str]:
         return {"status": "ok"}
 
-    # ✅ /mcp, /mcp/ 둘 다 직접 마운트해서 슬래시 이슈 제거
-    sub = mcp.streamable_http_app()
-    app.mount("/mcp", sub)
-    app.mount("/mcp/", sub)
+    # ✅ 핵심: MCP를 루트에 마운트
+    app.mount("/", mcp.streamable_http_app())
 
     return app
 
