@@ -237,20 +237,19 @@ def typhoon_action_guide_system_prompt() -> str:
 # ---------- ASGI 앱 ----------
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Typhoon Action Guide MCP")
+    # 핵심: redirect_slashes=False 로 /mcp <-> /mcp/ 리다이렉트(307) 방지
+    app = FastAPI(
+        title="Typhoon Action Guide MCP",
+        redirect_slashes=False,
+        lifespan=lambda app_: mcp.session_manager.run(),
+    )
 
     @app.get("/health")
     def health() -> Dict[str, str]:
         return {"status": "ok"}
 
-    # FastMCP 스트리머블 HTTP 마운트
-    app = FastAPI(lifespan=lambda app: mcp.session_manager.run(), title="Typhoon Action Guide MCP")
+    # MCP 엔드포인트
     app.mount("/mcp", mcp.streamable_http_app())
-
-    # /health 재추가(위에서 app 재정의하므로)
-    @app.get("/health")
-    def health2() -> Dict[str, str]:
-        return {"status": "ok"}
 
     return app
 
