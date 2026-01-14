@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import json
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -21,6 +22,9 @@ from .utils import TTLCache, haversine_km
 SERVICE_NAME = "TyphoonActionGuide"
 SERVICE_VERSION = os.getenv("SERVICE_VERSION", "0.1.0")
 
+# MCP 프로토콜 버전(클라이언트가 주면 그걸 echo, 없으면 기본값)
+DEFAULT_PROTOCOL_VERSION = os.getenv("MCP_PROTOCOL_VERSION", "2024-11-05")
+
 ALLOWED_HOSTS = [
     "typhoon-action-guide-mcp.onrender.com",
     "*.onrender.com",
@@ -29,7 +33,6 @@ ALLOWED_HOSTS = [
 
 cache = TTLCache(int(os.getenv("CACHE_TTL_SECONDS", "120")))
 _data_client = None
-
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -113,18 +116,18 @@ def _jsonrpc_err(_id: Any, code: int, message: str, data: Any = None) -> JSONRes
 
 
 def _normalize_method(method: str) -> str:
-    """
-    PlayMCP/클라이언트별로 메서드 표기가 다를 수 있어서 폭넓게 수용.
-    - tools/list  / tools.list
-    - prompts/list / prompts.list
-    """
     m = (method or "").strip()
-    m = m.replace(".", "/")
-    return m
+    # tools.list → tools/list 같은 변형 수용
+    return m.replace(".", "/")
+
+
+def _log(msg: str):
+    # Render 로그에 그대로 찍힘
+    print(msg, flush=True)
 
 
 # =========================================================
-# MCP 메타 (tools / prompts)
+# MCP 메타 (tools / prompts / resources)
 # =========================================================
 TOOLS: List[Dict[str, Any]] = [
     {
@@ -168,9 +171,18 @@ PROMPTS: List[Dict[str, Any]] = [
 # MCP 메서드 구현
 # =========================================================
 async def handle_initialize(params: Dict[str, Any]) -> Dict[str, Any]:
+    # MCP 표준: protocolVersion을 반드시 포함(클라이언트가 보내면 echo)
+    pv = params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION
+
     return {
+        "protocolVersion": pv,
         "serverInfo": {"name": SERVICE_NAME, "version": SERVICE_VERSION},
-        "capabilities": {"tools": {}, "prompts": {}},
+        "capabilities": {
+            "tools": {},      # 최소 형태
+            "prompts": {},    # 최소 형태
+            "resources": {},  # 최소 형태
+            "logging": {},    # 최소 형태
+        },
         "instructions": (
             "태풍 대응 행동 가이드 MCP입니다. "
             "지역을 입력하면 근접 시각/거리 등을 단순 추정해 요약합니다. "
@@ -185,6 +197,32 @@ async def handle_tools_list() -> Dict[str, Any]:
 
 async def handle_prompts_list() -> Dict[str, Any]:
     return {"prompts": PROMPTS}
+
+
+async def handle_prompts_get(params: Dict[str, Any]) -> Dict[str, Any]:
+    # prompts/get 스텁(클라이언트가 요구할 수 있음)
+    name = params.get("name") or "typhoon_action_guide_system_prompt"
+    return {
+        "prompt": {
+            "name": name,
+            "description": "태풍 대응 행동 가이드 MCP 기본 프롬프트",
+            "messages": [{"role": "system", "content": [{"type": "text", "text": "태풍 대응 행동 가이드 MCP입니다."}]}],
+        }
+    }
+
+
+async def handle_resources_list() -> Dict[str, Any]:
+    # 리소스 기능 안 쓰면 빈 배열로
+    return {"resources": []}
+
+
+async def handle_ping() -> Dict[str, Any]:
+    return {"ok": True}
+
+
+async def handle_logging_set_level(params: Dict[str, Any]) -> Dict[str, Any]:
+    # 로깅레벨 설정 요청이 와도 실패하지 않게 수용
+    return {"ok": True}
 
 
 async def tool_get_live_typhoon_summary(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -223,24 +261,13 @@ async def tool_get_live_typhoon_summary(args: Dict[str, Any]) -> Dict[str, Any]:
             "firstTypTm": t.get("firstTypTm"),
             "lastTypTm": t.get("lastTypTm"),
         },
-        "latest_point": {
-            "time": _fmt_dt14_kst(str(last.get("typTm"))) if last else None,
-            "lat": last.get("lat") if last else None,
-            "lon": last.get("lon") if last else None,
-            "typLoc": last.get("typLoc") if last else None,
-            "typWs": last.get("typWs") if last else None,
-            "typPs": last.get("typPs") if last else None,
-        }
-        if last
-        else None,
+        "latest_point": last,
         "location": {"input": location, "geocoded": {"lat": loc[0], "lon": loc[1]} if loc else None},
         "proximity": near,
         "data_range_used": {"from": str(from_d), "to": str(to_d)},
         "disclaimer": "통보문 기반 좌표로 근접 시각을 단순 추정한 값입니다.",
     }
 
-    # JSON을 텍스트로 넣어도 되지만, 보기 좋게 json 문자열로
-    import json
     return {"content": [_text_content(json.dumps(payload, ensure_ascii=False, indent=2))]}
 
 
@@ -269,7 +296,6 @@ async def tool_search_past_typhoons(args: Dict[str, Any]) -> Dict[str, Any]:
         if matches and year is None:
             break
 
-    import json
     return {"content": [_text_content(json.dumps({"ok": True, "results": matches[:20]}, ensure_ascii=False, indent=2))]}
 
 
@@ -284,8 +310,6 @@ async def tool_get_past_typhoon_track(args: Dict[str, Any]) -> Dict[str, Any]:
         from_d=date.today() - timedelta(days=365 * 10),
         to_d=date.today() + timedelta(days=1),
     )
-
-    import json
     return {"content": [_text_content(json.dumps({"ok": True, "typSeq": typ_seq, "count": len(pts), "points": pts}, ensure_ascii=False))]}
 
 
@@ -306,22 +330,25 @@ async def handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
 async def dispatch(method: str, params: Dict[str, Any]) -> Any:
     m = _normalize_method(method)
 
+    # ✅ 자주 쓰는 표준 메서드
     if m == "initialize":
         return await handle_initialize(params)
-
     if m == "tools/list":
         return await handle_tools_list()
-
     if m == "tools/call":
         return await handle_tools_call(params)
-
     if m == "prompts/list":
         return await handle_prompts_list()
-
-    # 호환: 클라이언트가 "prompts/get" 같은 걸 부를 수 있어서 최소로 응답
     if m == "prompts/get":
-        # 간단히 1개만 반환
-        return {"prompt": {"name": "typhoon_action_guide_system_prompt", "content": "태풍 대응 행동 가이드 MCP입니다."}}
+        return await handle_prompts_get(params)
+
+    # ✅ PlayMCP/클라이언트가 추가로 찌를 수 있는 것들
+    if m == "resources/list":
+        return await handle_resources_list()
+    if m == "ping":
+        return await handle_ping()
+    if m == "logging/setLevel":
+        return await handle_logging_set_level(params)
 
     raise ValueError(f"Unsupported method: {method}")
 
@@ -348,27 +375,22 @@ def health():
     return {"status": "ok"}
 
 
-# ----- "정보 불러오기" 사전 확인용: GET/HEAD에서도 200을 주자 -----
+# ---- 사전검증용 GET/HEAD ----
 @app.get("/")
 @app.head("/")
 def root_probe():
-    return {
-        "name": SERVICE_NAME,
-        "version": SERVICE_VERSION,
-        "hint": "Use POST JSON-RPC to /mcp (or /) for MCP methods.",
-    }
+    return {"name": SERVICE_NAME, "version": SERVICE_VERSION, "hint": "POST JSON-RPC to /mcp"}
 
 
 @app.get("/mcp")
 @app.head("/mcp")
 def mcp_probe():
-    # PlayMCP가 GET/HEAD로 먼저 찌를 때 실패(405)하지 않게 200 반환
     return {
         "name": SERVICE_NAME,
         "version": SERVICE_VERSION,
         "jsonrpc": "2.0",
         "accepts": "POST",
-        "methods": ["initialize", "tools/list", "tools/call", "prompts/list"],
+        "methods": ["initialize", "tools/list", "tools/call", "prompts/list", "resources/list", "ping"],
     }
 
 
@@ -385,7 +407,7 @@ def options_probe():
     return Response(status_code=204)
 
 
-# ----- JSON-RPC 핸들러: /mcp 와 / 모두 받기(PlayMCP 변형 대비) -----
+# ---- JSON-RPC 핸들러 ----
 async def _handle_jsonrpc(request: Request) -> Union[JSONResponse, Response]:
     try:
         payload = await request.json()
@@ -403,22 +425,26 @@ async def _handle_jsonrpc(request: Request) -> Union[JSONResponse, Response]:
         if obj.get("jsonrpc") != "2.0" or not method:
             return {"jsonrpc": "2.0", "id": _id, "error": {"code": -32600, "message": "Invalid Request"}}
 
+        _log(f"[MCP] method={method} params_keys={list(params.keys()) if isinstance(params, dict) else type(params)}")
+
         try:
-            result = await dispatch(method, params)
+            result = await dispatch(method, params if isinstance(params, dict) else {})
             return {"jsonrpc": "2.0", "id": _id, "result": result}
         except ValueError as e:
             return {"jsonrpc": "2.0", "id": _id, "error": {"code": -32601, "message": "Method not found", "data": str(e)}}
         except Exception as e:
             return {"jsonrpc": "2.0", "id": _id, "error": {"code": -32603, "message": "Internal error", "data": str(e)}}
 
-    # 배치 요청(list) 대응
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if created:
+        headers["Mcp-Session-Id"] = session_id
+
+    # 배치 요청(list)
     if isinstance(payload, list):
         results = [await handle_one(p) for p in payload if isinstance(p, dict)]
-        headers = {"Content-Type": "application/json; charset=utf-8"}
-        if created:
-            headers["Mcp-Session-Id"] = session_id
         return JSONResponse(results, headers=headers)
 
+    # 단일 요청(dict)
     if not isinstance(payload, dict):
         return _jsonrpc_err(None, -32600, "Invalid Request")
 
@@ -429,8 +455,10 @@ async def _handle_jsonrpc(request: Request) -> Union[JSONResponse, Response]:
     if payload.get("jsonrpc") != "2.0" or not method:
         return _jsonrpc_err(_id, -32600, "Invalid Request")
 
+    _log(f"[MCP] method={method} params_keys={list(params.keys()) if isinstance(params, dict) else type(params)}")
+
     try:
-        result = await dispatch(method, params)
+        result = await dispatch(method, params if isinstance(params, dict) else {})
         return _jsonrpc_ok(_id, result, session_id=session_id, set_session=created)
     except ValueError as e:
         return _jsonrpc_err(_id, -32601, "Method not found", data=str(e))
@@ -444,9 +472,9 @@ async def mcp_post(request: Request):
     return await _handle_jsonrpc(request)
 
 
+# 루트 POST로도 받기(클라이언트 변형 대비)
 @app.post("/")
 async def root_post(request: Request):
-    # PlayMCP가 루트로 때려도 통과하도록
     return await _handle_jsonrpc(request)
 
 
