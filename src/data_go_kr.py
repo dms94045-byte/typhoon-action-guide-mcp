@@ -8,7 +8,7 @@ import httpx
 
 from .utils import TTLCache
 
-BASE_URL = "http://apis.data.go.kr/1360000/TyphoonInfoService/getTyphoonInfo"
+BASE_URL = "https://apis.data.go.kr/1360000/TyphoonInfoService/getTyphoonInfo"
 
 
 def _yyyymmdd(d: date) -> str:
