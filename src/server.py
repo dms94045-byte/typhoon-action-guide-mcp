@@ -20,10 +20,44 @@ from .utils import TTLCache, haversine_km
 # -------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("mcp")
+logger = logging.getLogger("typhoon-mcp")
 
-# 개발 중에만 true 권장(응답에 trace를 내려줌). 운영/심사 전엔 false 권장.
 DEBUG_TOOL_ERRORS = os.getenv("DEBUG_TOOL_ERRORS", "true").lower() in ("1", "true", "yes", "y")
+
+
+def _text_content(text: str) -> Dict[str, str]:
+    return {"type": "text", "text": text}
+
+
+def _tool_error_response(msg: str, detail: Optional[str] = None) -> Dict[str, Any]:
+    if detail and DEBUG_TOOL_ERRORS:
+        text = f"{msg}\n\n[detail]\n{detail}"
+    else:
+        text = msg
+    return {"content": [_text_content(text)], "isError": True}
+
+
+def safe_tool(fn):
+    """
+    tool 내부 예외를:
+    1) Render 로그에 traceback 출력
+    2) PlayMCP가 이해하는 표준 에러 형태로 반환
+    """
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            tb = traceback.format_exc()
+            try:
+                kwargs_dump = json.dumps(kwargs, ensure_ascii=False)
+            except Exception:
+                kwargs_dump = repr(kwargs)
+
+            logger.error("[TOOL ERROR] tool=%s kwargs=%s err=%s\n%s", fn.__name__, kwargs_dump, str(e), tb)
+            return _tool_error_response("error while calling tool", detail=f"tool={fn.__name__}\nerr={e}\n\n{tb}")
+
+    return wrapper
 
 
 def _parse_date_yyyymmdd(s: str) -> date:
@@ -31,7 +65,6 @@ def _parse_date_yyyymmdd(s: str) -> date:
 
 
 def _fmt_dt14_kst(typ_tm: str) -> str:
-    # data.go.kr는 KST 기준이 섞여 있을 수 있고, typTm는 YYYYMMDDHHMM 형태
     try:
         dt = datetime.strptime(typ_tm, "%Y%m%d%H%M")
         return dt.strftime("%Y-%m-%d %H:%M")
@@ -44,7 +77,6 @@ def _pick_most_relevant_typhoon(typhoons: List[Dict[str, Any]]) -> Optional[Dict
 
 
 def _summarize_track_near_location(points: List[Dict[str, Any]], loc_lat: float, loc_lon: float) -> Dict[str, Any]:
-    # 가장 가까운 지점과 그 시각을 찾고, 근접 전후 시간을 '영향 가능 시간대'로 제공
     best = None
     for p in points:
         dist = haversine_km(loc_lat, loc_lon, p["lat"], p["lon"])
@@ -54,7 +86,6 @@ def _summarize_track_near_location(points: List[Dict[str, Any]], loc_lat: float,
     if best is None:
         return {"closest": None, "impact_window": None}
 
-    # 근접 시각 +/- 6시간을 임시 영향 가능 시간대로 제안(정밀 예보 대체가 아님)
     typ_tm = best["p"].get("typTm", "")
     try:
         dt = datetime.strptime(typ_tm, "%Y%m%d%H%M")
@@ -80,63 +111,13 @@ def _summarize_track_near_location(points: List[Dict[str, Any]], loc_lat: float,
 
 
 # -------------------------
-# MCP error response helpers
-# -------------------------
-def _text_content(text: str) -> Dict[str, str]:
-    return {"type": "text", "text": text}
-
-
-def _tool_error_response(msg: str, detail: Optional[str] = None) -> Dict[str, Any]:
-    # PlayMCP가 그대로 표시 가능한 표준 형태
-    if detail and DEBUG_TOOL_ERRORS:
-        text = f"{msg}\n\n[detail]\n{detail}"
-    else:
-        text = msg
-    return {"content": [_text_content(text)], "isError": True}
-
-
-def safe_tool(fn):
-    """
-    FastMCP tool 실행 중 예외가 나면:
-    - Render 로그에 traceback 남기고
-    - MCP 표준 에러 형태로 응답
-    """
-    @wraps(fn)
-    async def wrapper(*args, **kwargs):
-        try:
-            return await fn(*args, **kwargs)
-        except Exception as e:
-            tb = traceback.format_exc()
-            # args/kwargs는 너무 길 수 있어 요약
-            try:
-                kwargs_dump = json.dumps(kwargs, ensure_ascii=False)
-            except Exception:
-                kwargs_dump = repr(kwargs)
-
-            logger.error(
-                "[TOOL ERROR] tool=%s kwargs=%s err=%s\n%s",
-                fn.__name__,
-                kwargs_dump,
-                str(e),
-                tb,
-            )
-
-            return _tool_error_response(
-                "error while calling tool",
-                detail=f"tool={fn.__name__}\nerr={str(e)}\n\ntrace:\n{tb}",
-            )
-    return wrapper
-
-
-# -------------------------
-# MCP server
+# MCP 서버
 # -------------------------
 cache = TTLCache(int(os.getenv("CACHE_TTL_SECONDS", "120")))
 _data_client = None
 
 
 def _get_data_client():
-    """환경변수 미설정 시에도 서버가 죽지 않도록 지연 초기화."""
     global _data_client
     if _data_client is None:
         _data_client = build_client_from_env(cache=cache)
@@ -149,15 +130,7 @@ mcp = FastMCP(name="TyphoonActionGuide", stateless_http=True)
 @mcp.tool(description="최근(기본: 최근 3일~내일) 기준으로 현재/근접 태풍의 요약과 사용자의 지역 기준 영향 가능 시간대를 반환합니다.")
 @safe_tool
 async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, Any]:
-    try:
-        data_client = _get_data_client()
-    except Exception as e:
-        # 여기서는 '툴 에러'로 처리해도 되고, 친절 메시지로 처리해도 됨.
-        # 일단 PlayMCP에서 명확히 보이도록 에러 형태로 반환.
-        return _tool_error_response(
-            "DATA_GO_KR_SERVICE_KEY 설정이 필요합니다.",
-            detail=str(e),
-        )
+    data_client = _get_data_client()
 
     from_d, to_d = default_recent_range(3, 1)
     typhoons = await data_client.list_unique_typhoons_in_range(from_d, to_d)
@@ -172,7 +145,6 @@ async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, 
     t = _pick_most_relevant_typhoon(typhoons)
     typ_seq = int(t.get("typSeq", 0))
 
-    # track point는 발표 기반이므로 최근 7일 정도로 확장해서 탐색
     pts = await data_client.get_track_points(
         typ_seq=typ_seq,
         from_d=date.today() - timedelta(days=7),
@@ -206,21 +178,17 @@ async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, 
         "location": {
             "input": location,
             "geocoded": {"lat": loc[0], "lon": loc[1]} if loc else None,
-            "note": "지역을 제공하면 해당 지역 중심 좌표(대략)로 근접 시각을 추정합니다." if location else "지역이 없으면 전국 공통 요약만 제공합니다.",
         },
         "proximity": near,
         "data_range_used": {"from": str(from_d), "to": str(to_d)},
-        "disclaimer": "이 도구는 통보문 기반 좌표를 이용해 '근접 시각'을 단순 추정합니다. 정확한 상륙/통과 시각은 기상청 최신 태풍정보/특보를 함께 확인하세요.",
+        "disclaimer": "통보문 기반 좌표로 근접 시각을 단순 추정합니다. 정확한 정보는 기상청을 함께 확인하세요.",
     }
 
 
 @mcp.tool(description="연도(기본: 최근 10년) 또는 이름 일부로 과거 태풍 후보를 검색해 목록을 반환합니다.")
 @safe_tool
 async def search_past_typhoons(query: str, year: Optional[int] = None) -> Dict[str, Any]:
-    try:
-        data_client = _get_data_client()
-    except Exception as e:
-        return _tool_error_response("DATA_GO_KR_SERVICE_KEY 설정이 필요합니다.", detail=str(e))
+    data_client = _get_data_client()
 
     q = (query or "").strip()
     if not q and year is None:
@@ -253,7 +221,7 @@ async def search_past_typhoons(query: str, year: Optional[int] = None) -> Dict[s
         "query": q,
         "year": year,
         "results": matches,
-        "hint": "결과의 typSeq(태풍번호)로 get_past_typhoon_track을 호출하면 경로 포인트를 받을 수 있습니다.",
+        "hint": "결과의 typSeq로 get_past_typhoon_track을 호출하면 경로 포인트를 받을 수 있습니다.",
     }
 
 
@@ -264,10 +232,7 @@ async def get_past_typhoon_track(
     from_yyyymmdd: Optional[str] = None,
     to_yyyymmdd: Optional[str] = None,
 ) -> Dict[str, Any]:
-    try:
-        data_client = _get_data_client()
-    except Exception as e:
-        return _tool_error_response("DATA_GO_KR_SERVICE_KEY 설정이 필요합니다.", detail=str(e))
+    data_client = _get_data_client()
 
     if typSeq <= 0:
         return {"ok": False, "message": "typSeq는 1 이상의 정수여야 합니다."}
@@ -294,7 +259,6 @@ async def get_past_typhoon_track(
         "range": {"from": str(from_d), "to": str(to_d)},
         "count": len(pts),
         "points": pts,
-        "disclaimer": "공공데이터포털 태풍 통보문 기반 포인트입니다(베스트트랙과 다를 수 있음).",
     }
 
 
@@ -304,21 +268,23 @@ def typhoon_action_guide_system_prompt() -> str:
 
 
 # -------------------------
-# ASGI app
+# ASGI app (중요: lifespan 제거 / app 한 번만 생성)
 # -------------------------
-def create_app() -> FastAPI:
-    # FastMCP 스트리머블 HTTP 마운트
-    app = FastAPI(lifespan=lambda app: mcp.session_manager.run(), title="Typhoon Action Guide MCP")
-    app.mount("/mcp", mcp.streamable_http_app())
-
-    @app.get("/health")
-    def health() -> Dict[str, str]:
-        return {"status": "ok"}
-
-    return app
+app = FastAPI(title="Typhoon Action Guide MCP")
 
 
-app = create_app()
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Typhoon Action Guide MCP"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# MCP Streamable HTTP mount
+app.mount("/mcp", mcp.streamable_http_app())
 
 
 if __name__ == "__main__":
