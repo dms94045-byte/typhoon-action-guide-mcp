@@ -1,52 +1,37 @@
 from __future__ import annotations
 
-import os
-import uuid
 import json
+import logging
+import os
+import traceback
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Union
+from functools import wraps
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+from fastapi import FastAPI
+from mcp.server.fastmcp import FastMCP
 
 from .data_go_kr import build_client_from_env, default_recent_range
 from .geo_kr import geocode_korea
 from .utils import TTLCache, haversine_km
 
+# -------------------------
+# Logging
+# -------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("mcp")
 
-# =========================================================
-# 기본 설정
-# =========================================================
-SERVICE_NAME = "TyphoonActionGuide"
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "0.1.0")
-
-# MCP 프로토콜 버전(클라이언트가 주면 그걸 echo, 없으면 기본값)
-DEFAULT_PROTOCOL_VERSION = os.getenv("MCP_PROTOCOL_VERSION", "2024-11-05")
-
-ALLOWED_HOSTS = [
-    "typhoon-action-guide-mcp.onrender.com",
-    "*.onrender.com",
-    "*",  # 제출/데모용 (운영 전환 시 좁히기)
-]
-
-cache = TTLCache(int(os.getenv("CACHE_TTL_SECONDS", "120")))
-_data_client = None
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+# 개발 중에만 true 권장(응답에 trace를 내려줌). 운영/심사 전엔 false 권장.
+DEBUG_TOOL_ERRORS = os.getenv("DEBUG_TOOL_ERRORS", "true").lower() in ("1", "true", "yes", "y")
 
 
-def _get_data_client():
-    global _data_client
-    if _data_client is None:
-        _data_client = build_client_from_env(cache=cache)
-    return _data_client
+def _parse_date_yyyymmdd(s: str) -> date:
+    return datetime.strptime(s, "%Y%m%d").date()
 
 
-# =========================================================
-# 유틸
-# =========================================================
 def _fmt_dt14_kst(typ_tm: str) -> str:
+    # data.go.kr는 KST 기준이 섞여 있을 수 있고, typTm는 YYYYMMDDHHMM 형태
     try:
         dt = datetime.strptime(typ_tm, "%Y%m%d%H%M")
         return dt.strftime("%Y-%m-%d %H:%M")
@@ -59,6 +44,7 @@ def _pick_most_relevant_typhoon(typhoons: List[Dict[str, Any]]) -> Optional[Dict
 
 
 def _summarize_track_near_location(points: List[Dict[str, Any]], loc_lat: float, loc_lon: float) -> Dict[str, Any]:
+    # 가장 가까운 지점과 그 시각을 찾고, 근접 전후 시간을 '영향 가능 시간대'로 제공
     best = None
     for p in points:
         dist = haversine_km(loc_lat, loc_lon, p["lat"], p["lon"])
@@ -68,12 +54,15 @@ def _summarize_track_near_location(points: List[Dict[str, Any]], loc_lat: float,
     if best is None:
         return {"closest": None, "impact_window": None}
 
-    typ_tm = str(best["p"].get("typTm", ""))
+    # 근접 시각 +/- 6시간을 임시 영향 가능 시간대로 제안(정밀 예보 대체가 아님)
+    typ_tm = best["p"].get("typTm", "")
     try:
         dt = datetime.strptime(typ_tm, "%Y%m%d%H%M")
+        start = dt - timedelta(hours=6)
+        end = dt + timedelta(hours=6)
         window = {
-            "start": (dt - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M"),
-            "end": (dt + timedelta(hours=6)).strftime("%Y-%m-%d %H:%M"),
+            "start": start.strftime("%Y-%m-%d %H:%M"),
+            "end": end.strftime("%Y-%m-%d %H:%M"),
             "center": dt.strftime("%Y-%m-%d %H:%M"),
         }
     except Exception:
@@ -86,173 +75,118 @@ def _summarize_track_near_location(points: List[Dict[str, Any]], loc_lat: float,
         "typhoon_lon": best["p"].get("lon"),
         "typLoc": best["p"].get("typLoc"),
     }
+
     return {"closest": closest, "impact_window": window}
 
 
-def _text_content(text: str) -> Dict[str, Any]:
+# -------------------------
+# MCP error response helpers
+# -------------------------
+def _text_content(text: str) -> Dict[str, str]:
     return {"type": "text", "text": text}
 
 
-def _ensure_session(session_id: Optional[str]) -> Tuple[str, bool]:
-    if session_id and session_id in SESSIONS:
-        return session_id, False
-    new_id = uuid.uuid4().hex
-    SESSIONS[new_id] = {"created_at": datetime.utcnow().isoformat() + "Z"}
-    return new_id, True
+def _tool_error_response(msg: str, detail: Optional[str] = None) -> Dict[str, Any]:
+    # PlayMCP가 그대로 표시 가능한 표준 형태
+    if detail and DEBUG_TOOL_ERRORS:
+        text = f"{msg}\n\n[detail]\n{detail}"
+    else:
+        text = msg
+    return {"content": [_text_content(text)], "isError": True}
 
 
-def _jsonrpc_ok(_id: Any, result: Any, session_id: Optional[str] = None, set_session: bool = False) -> JSONResponse:
-    headers = {"Content-Type": "application/json; charset=utf-8"}
-    if session_id and set_session:
-        headers["Mcp-Session-Id"] = session_id
-    return JSONResponse({"jsonrpc": "2.0", "id": _id, "result": result}, headers=headers)
+def safe_tool(fn):
+    """
+    FastMCP tool 실행 중 예외가 나면:
+    - Render 로그에 traceback 남기고
+    - MCP 표준 에러 형태로 응답
+    """
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            tb = traceback.format_exc()
+            # args/kwargs는 너무 길 수 있어 요약
+            try:
+                kwargs_dump = json.dumps(kwargs, ensure_ascii=False)
+            except Exception:
+                kwargs_dump = repr(kwargs)
+
+            logger.error(
+                "[TOOL ERROR] tool=%s kwargs=%s err=%s\n%s",
+                fn.__name__,
+                kwargs_dump,
+                str(e),
+                tb,
+            )
+
+            return _tool_error_response(
+                "error while calling tool",
+                detail=f"tool={fn.__name__}\nerr={str(e)}\n\ntrace:\n{tb}",
+            )
+    return wrapper
 
 
-def _jsonrpc_err(_id: Any, code: int, message: str, data: Any = None) -> JSONResponse:
-    err = {"code": code, "message": message}
-    if data is not None:
-        err["data"] = data
-    return JSONResponse({"jsonrpc": "2.0", "id": _id, "error": err})
+# -------------------------
+# MCP server
+# -------------------------
+cache = TTLCache(int(os.getenv("CACHE_TTL_SECONDS", "120")))
+_data_client = None
 
 
-def _normalize_method(method: str) -> str:
-    m = (method or "").strip()
-    # tools.list → tools/list 같은 변형 수용
-    return m.replace(".", "/")
+def _get_data_client():
+    """환경변수 미설정 시에도 서버가 죽지 않도록 지연 초기화."""
+    global _data_client
+    if _data_client is None:
+        _data_client = build_client_from_env(cache=cache)
+    return _data_client
 
 
-def _log(msg: str):
-    # Render 로그에 그대로 찍힘
-    print(msg, flush=True)
+mcp = FastMCP(name="TyphoonActionGuide", stateless_http=True)
 
 
-# =========================================================
-# MCP 메타 (tools / prompts / resources)
-# =========================================================
-TOOLS: List[Dict[str, Any]] = [
-    {
-        "name": "get_live_typhoon_summary",
-        "description": "최근 기준으로 현재/근접 태풍 요약과 지역 기준 영향 가능 시간대를 반환합니다.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"location": {"type": "string", "description": "예: 제주, 서귀포, 부산, 서울"}},
-            "required": [],
-        },
-    },
-    {
-        "name": "search_past_typhoons",
-        "description": "이름 일부/연도로 과거 태풍 후보를 검색해 목록을 반환합니다.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "태풍 이름(한글/영문 일부)"},
-                "year": {"type": "integer", "description": "연도(예: 2020)"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "get_past_typhoon_track",
-        "description": "지정한 태풍번호(typSeq)의 경로 포인트(위경도/시각)를 반환합니다.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"typSeq": {"type": "integer", "description": "태풍 번호(typSeq)"}},
-            "required": ["typSeq"],
-        },
-    },
-]
-
-PROMPTS: List[Dict[str, Any]] = [
-    {"name": "typhoon_action_guide_system_prompt", "description": "태풍 대응 행동 가이드 MCP 기본 프롬프트", "arguments": []}
-]
-
-
-# =========================================================
-# MCP 메서드 구현
-# =========================================================
-async def handle_initialize(params: Dict[str, Any]) -> Dict[str, Any]:
-    # MCP 표준: protocolVersion을 반드시 포함(클라이언트가 보내면 echo)
-    pv = params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION
-
-    return {
-        "protocolVersion": pv,
-        "serverInfo": {"name": SERVICE_NAME, "version": SERVICE_VERSION},
-        "capabilities": {
-            "tools": {},      # 최소 형태
-            "prompts": {},    # 최소 형태
-            "resources": {},  # 최소 형태
-            "logging": {},    # 최소 형태
-        },
-        "instructions": (
-            "태풍 대응 행동 가이드 MCP입니다. "
-            "지역을 입력하면 근접 시각/거리 등을 단순 추정해 요약합니다. "
-            "정확한 상륙/통과 시각은 기상청 최신 발표를 함께 확인하세요."
-        ),
-    }
-
-
-async def handle_tools_list() -> Dict[str, Any]:
-    return {"tools": TOOLS}
-
-
-async def handle_prompts_list() -> Dict[str, Any]:
-    return {"prompts": PROMPTS}
-
-
-async def handle_prompts_get(params: Dict[str, Any]) -> Dict[str, Any]:
-    # prompts/get 스텁(클라이언트가 요구할 수 있음)
-    name = params.get("name") or "typhoon_action_guide_system_prompt"
-    return {
-        "prompt": {
-            "name": name,
-            "description": "태풍 대응 행동 가이드 MCP 기본 프롬프트",
-            "messages": [{"role": "system", "content": [{"type": "text", "text": "태풍 대응 행동 가이드 MCP입니다."}]}],
-        }
-    }
-
-
-async def handle_resources_list() -> Dict[str, Any]:
-    # 리소스 기능 안 쓰면 빈 배열로
-    return {"resources": []}
-
-
-async def handle_ping() -> Dict[str, Any]:
-    return {"ok": True}
-
-
-async def handle_logging_set_level(params: Dict[str, Any]) -> Dict[str, Any]:
-    # 로깅레벨 설정 요청이 와도 실패하지 않게 수용
-    return {"ok": True}
-
-
-async def tool_get_live_typhoon_summary(args: Dict[str, Any]) -> Dict[str, Any]:
-    location = args.get("location")
-
+@mcp.tool(description="최근(기본: 최근 3일~내일) 기준으로 현재/근접 태풍의 요약과 사용자의 지역 기준 영향 가능 시간대를 반환합니다.")
+@safe_tool
+async def get_live_typhoon_summary(location: Optional[str] = None) -> Dict[str, Any]:
     try:
-        client = _get_data_client()
+        data_client = _get_data_client()
     except Exception as e:
-        return {"content": [_text_content(f"데이터 클라이언트 초기화 실패: {e}\nDATA_GO_KR_SERVICE_KEY 설정을 확인하세요.")]}
+        # 여기서는 '툴 에러'로 처리해도 되고, 친절 메시지로 처리해도 됨.
+        # 일단 PlayMCP에서 명확히 보이도록 에러 형태로 반환.
+        return _tool_error_response(
+            "DATA_GO_KR_SERVICE_KEY 설정이 필요합니다.",
+            detail=str(e),
+        )
 
     from_d, to_d = default_recent_range(3, 1)
-    typhoons = await client.list_unique_typhoons_in_range(from_d, to_d)
+    typhoons = await data_client.list_unique_typhoons_in_range(from_d, to_d)
 
     if not typhoons:
-        return {"content": [_text_content("현재 조회 범위 내 태풍 정보가 확인되지 않습니다.")]}
+        return {
+            "has_active_typhoon": False,
+            "message": "현재 조회 범위(최근 며칠) 내에 태풍 정보가 확인되지 않습니다.",
+            "range": {"from": str(from_d), "to": str(to_d)},
+        }
 
     t = _pick_most_relevant_typhoon(typhoons)
     typ_seq = int(t.get("typSeq", 0))
 
-    pts = await client.get_track_points(
+    # track point는 발표 기반이므로 최근 7일 정도로 확장해서 탐색
+    pts = await data_client.get_track_points(
         typ_seq=typ_seq,
         from_d=date.today() - timedelta(days=7),
         to_d=date.today() + timedelta(days=2),
     )
 
     loc = geocode_korea(location or "")
-    near = _summarize_track_near_location(pts, loc_lat=loc[0], loc_lon=loc[1]) if (loc and pts) else None
+    near = None
+    if loc and pts:
+        near = _summarize_track_near_location(pts, loc_lat=loc[0], loc_lon=loc[1])
+
     last = pts[-1] if pts else None
 
-    payload = {
+    return {
         "has_active_typhoon": True,
         "typhoon": {
             "typSeq": typ_seq,
@@ -261,248 +195,134 @@ async def tool_get_live_typhoon_summary(args: Dict[str, Any]) -> Dict[str, Any]:
             "firstTypTm": t.get("firstTypTm"),
             "lastTypTm": t.get("lastTypTm"),
         },
-        "latest_point": last,
-        "location": {"input": location, "geocoded": {"lat": loc[0], "lon": loc[1]} if loc else None},
+        "latest_point": {
+            "time": _fmt_dt14_kst(last.get("typTm", "")) if last else None,
+            "lat": last.get("lat") if last else None,
+            "lon": last.get("lon") if last else None,
+            "typLoc": last.get("typLoc") if last else None,
+            "typWs": last.get("typWs") if last else None,
+            "typPs": last.get("typPs") if last else None,
+        } if last else None,
+        "location": {
+            "input": location,
+            "geocoded": {"lat": loc[0], "lon": loc[1]} if loc else None,
+            "note": "지역을 제공하면 해당 지역 중심 좌표(대략)로 근접 시각을 추정합니다." if location else "지역이 없으면 전국 공통 요약만 제공합니다.",
+        },
         "proximity": near,
         "data_range_used": {"from": str(from_d), "to": str(to_d)},
-        "disclaimer": "통보문 기반 좌표로 근접 시각을 단순 추정한 값입니다.",
+        "disclaimer": "이 도구는 통보문 기반 좌표를 이용해 '근접 시각'을 단순 추정합니다. 정확한 상륙/통과 시각은 기상청 최신 태풍정보/특보를 함께 확인하세요.",
     }
 
-    return {"content": [_text_content(json.dumps(payload, ensure_ascii=False, indent=2))]}
 
+@mcp.tool(description="연도(기본: 최근 10년) 또는 이름 일부로 과거 태풍 후보를 검색해 목록을 반환합니다.")
+@safe_tool
+async def search_past_typhoons(query: str, year: Optional[int] = None) -> Dict[str, Any]:
+    try:
+        data_client = _get_data_client()
+    except Exception as e:
+        return _tool_error_response("DATA_GO_KR_SERVICE_KEY 설정이 필요합니다.", detail=str(e))
 
-async def tool_search_past_typhoons(args: Dict[str, Any]) -> Dict[str, Any]:
-    query = str(args.get("query", "")).strip()
-    year = args.get("year")
+    q = (query or "").strip()
+    if not q and year is None:
+        return {"ok": False, "message": "검색어(query) 또는 연도(year) 중 하나는 필요합니다."}
 
-    if not query and year is None:
-        return {"content": [_text_content("query 또는 year 중 하나는 필요합니다.")]}
-
-    client = _get_data_client()
     today = date.today()
+    years = [year] if year is not None else list(range(today.year, max(today.year - 9, 1950), -1))
 
-    # ✅ year를 주면 해당 연도만 정확히
-    if year is not None:
-        y = int(year)
-        typhoons = await client.list_unique_typhoons_in_range(date(y, 1, 1), date(y, 12, 31))
-        matches = []
+    matches: List[Dict[str, Any]] = []
+    for y in years[:10]:
+        from_d = date(y, 1, 1)
+        to_d = date(y, 12, 31)
+        typhoons = await data_client.list_unique_typhoons_in_range(from_d, to_d)
         for t in typhoons:
             name_kr = str(t.get("typName", ""))
             name_en = str(t.get("typEn", ""))
-            if (query in name_kr) or (query.lower() in name_en.lower()):
-                matches.append(t)
-        return {"content": [_text_content(json.dumps({"ok": True, "year": y, "results": matches[:30]}, ensure_ascii=False, indent=2))]}
-
-    # ✅ year가 없으면: 최근 10년만 보지 말고, 오래된 태풍도 찾도록 과거로 확장
-    # 너무 과도한 호출을 막기 위해 "최대 70년 전"까지만 (필요하면 숫자 늘려도 됨)
-    max_years_back = int(os.getenv("PAST_TY_SEARCH_MAX_YEARS_BACK", "70"))
-    start_year = today.year
-    end_year = max(today.year - max_years_back, 1950)
-
-    all_matches: List[Dict[str, Any]] = []
-    for y in range(start_year, end_year - 1, -1):
-        typhoons = await client.list_unique_typhoons_in_range(date(y, 1, 1), date(y, 12, 31))
-        matches = []
-        for t in typhoons:
-            name_kr = str(t.get("typName", ""))
-            name_en = str(t.get("typEn", ""))
-            if (query in name_kr) or (query.lower() in name_en.lower()):
+            if q:
+                if (q in name_kr) or (q.lower() in name_en.lower()):
+                    matches.append(t)
+            else:
                 matches.append(t)
 
-        if matches:
-            # ✅ 찾는 즉시 반환 (가장 최신 연도부터 내려가므로, 보통 여기서 끝남)
-            all_matches.extend(matches)
+        if matches and year is None:
             break
 
-    return {"content": [_text_content(json.dumps({"ok": True, "query": query, "results": all_matches[:30]}, ensure_ascii=False, indent=2))]}
+    matches = matches[:20]
 
-
-
-async def tool_get_past_typhoon_track(args: Dict[str, Any]) -> Dict[str, Any]:
-    typ_seq = int(args.get("typSeq", 0))
-    if typ_seq <= 0:
-        return {"content": [_text_content("typSeq는 1 이상의 정수여야 합니다.")]}
-
-    client = _get_data_client()
-    pts = await client.get_track_points(
-        typ_seq=typ_seq,
-        from_d=date.today() - timedelta(days=365 * 10),
-        to_d=date.today() + timedelta(days=1),
-    )
-    return {"content": [_text_content(json.dumps({"ok": True, "typSeq": typ_seq, "count": len(pts), "points": pts}, ensure_ascii=False))]}
-
-
-async def handle_tools_call(params: Dict[str, Any]) -> Dict[str, Any]:
-    name = params.get("name")
-    arguments = params.get("arguments") or {}
-
-    if name == "get_live_typhoon_summary":
-        return await tool_get_live_typhoon_summary(arguments)
-    if name == "search_past_typhoons":
-        return await tool_search_past_typhoons(arguments)
-    if name == "get_past_typhoon_track":
-        return await tool_get_past_typhoon_track(arguments)
-
-    return {"content": [_text_content(f"알 수 없는 tool: {name}")]}
-
-
-async def dispatch(method: str, params: Dict[str, Any]) -> Any:
-    m = _normalize_method(method)
-
-    # ✅ 자주 쓰는 표준 메서드
-    if m == "initialize":
-        return await handle_initialize(params)
-    if m == "tools/list":
-        return await handle_tools_list()
-    if m == "tools/call":
-        return await handle_tools_call(params)
-    if m == "prompts/list":
-        return await handle_prompts_list()
-    if m == "prompts/get":
-        return await handle_prompts_get(params)
-
-    # ✅ PlayMCP/클라이언트가 추가로 찌를 수 있는 것들
-    if m == "resources/list":
-        return await handle_resources_list()
-    if m == "ping":
-        return await handle_ping()
-    if m == "logging/setLevel":
-        return await handle_logging_set_level(params)
-
-    raise ValueError(f"Unsupported method: {method}")
-
-
-# =========================================================
-# FastAPI 앱
-# =========================================================
-app = FastAPI(title=f"{SERVICE_NAME} MCP", redirect_slashes=False)
-
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Mcp-Session-Id"],
-    max_age=86400,
-)
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# ---- 사전검증용 GET/HEAD ----
-@app.get("/")
-@app.head("/")
-def root_probe():
-    return {"name": SERVICE_NAME, "version": SERVICE_VERSION, "hint": "POST JSON-RPC to /mcp"}
-
-
-@app.get("/mcp")
-@app.head("/mcp")
-def mcp_probe():
     return {
-        "name": SERVICE_NAME,
-        "version": SERVICE_VERSION,
-        "jsonrpc": "2.0",
-        "accepts": "POST",
-        "methods": ["initialize", "tools/list", "tools/call", "prompts/list", "resources/list", "ping"],
+        "ok": True,
+        "query": q,
+        "year": year,
+        "results": matches,
+        "hint": "결과의 typSeq(태풍번호)로 get_past_typhoon_track을 호출하면 경로 포인트를 받을 수 있습니다.",
     }
 
 
-@app.get("/mcp/")
-@app.head("/mcp/")
-def mcp_probe_slash():
-    return mcp_probe()
-
-
-@app.options("/mcp")
-@app.options("/mcp/")
-@app.options("/")
-def options_probe():
-    return Response(status_code=204)
-
-
-# ---- JSON-RPC 핸들러 ----
-async def _handle_jsonrpc(request: Request) -> Union[JSONResponse, Response]:
+@mcp.tool(description="지정한 태풍번호(typSeq)의 기간 내 경로 포인트(위경도/시각)를 반환합니다. 기간이 없으면 자동 추정합니다.")
+@safe_tool
+async def get_past_typhoon_track(
+    typSeq: int,
+    from_yyyymmdd: Optional[str] = None,
+    to_yyyymmdd: Optional[str] = None,
+) -> Dict[str, Any]:
     try:
-        payload = await request.json()
-    except Exception:
-        return _jsonrpc_err(None, -32700, "Parse error")
-
-    incoming_session = request.headers.get("Mcp-Session-Id")
-    session_id, created = _ensure_session(incoming_session)
-
-    async def handle_one(obj: Dict[str, Any]) -> Dict[str, Any]:
-        _id = obj.get("id")
-        method = obj.get("method")
-        params = obj.get("params") or {}
-
-        if obj.get("jsonrpc") != "2.0" or not method:
-            return {"jsonrpc": "2.0", "id": _id, "error": {"code": -32600, "message": "Invalid Request"}}
-
-        _log(f"[MCP] method={method} params_keys={list(params.keys()) if isinstance(params, dict) else type(params)}")
-
-        try:
-            result = await dispatch(method, params if isinstance(params, dict) else {})
-            return {"jsonrpc": "2.0", "id": _id, "result": result}
-        except ValueError as e:
-            return {"jsonrpc": "2.0", "id": _id, "error": {"code": -32601, "message": "Method not found", "data": str(e)}}
-        except Exception as e:
-            return {"jsonrpc": "2.0", "id": _id, "error": {"code": -32603, "message": "Internal error", "data": str(e)}}
-
-    headers = {"Content-Type": "application/json; charset=utf-8"}
-    if created:
-        headers["Mcp-Session-Id"] = session_id
-
-    # 배치 요청(list)
-    if isinstance(payload, list):
-        results = [await handle_one(p) for p in payload if isinstance(p, dict)]
-        return JSONResponse(results, headers=headers)
-
-    # 단일 요청(dict)
-    if not isinstance(payload, dict):
-        return _jsonrpc_err(None, -32600, "Invalid Request")
-
-    _id = payload.get("id")
-    method = payload.get("method")
-    params = payload.get("params") or {}
-
-    if payload.get("jsonrpc") != "2.0" or not method:
-        return _jsonrpc_err(_id, -32600, "Invalid Request")
-
-    _log(f"[MCP] method={method} params_keys={list(params.keys()) if isinstance(params, dict) else type(params)}")
-
-    try:
-        result = await dispatch(method, params if isinstance(params, dict) else {})
-        return _jsonrpc_ok(_id, result, session_id=session_id, set_session=created)
-    except ValueError as e:
-        return _jsonrpc_err(_id, -32601, "Method not found", data=str(e))
+        data_client = _get_data_client()
     except Exception as e:
-        return _jsonrpc_err(_id, -32603, "Internal error", data=str(e))
+        return _tool_error_response("DATA_GO_KR_SERVICE_KEY 설정이 필요합니다.", detail=str(e))
+
+    if typSeq <= 0:
+        return {"ok": False, "message": "typSeq는 1 이상의 정수여야 합니다."}
+
+    if from_yyyymmdd and to_yyyymmdd:
+        from_d = _parse_date_yyyymmdd(from_yyyymmdd)
+        to_d = _parse_date_yyyymmdd(to_yyyymmdd)
+    else:
+        from_d, to_d = default_recent_range(30, 1)
+
+    pts = await data_client.get_track_points(typ_seq=typSeq, from_d=from_d, to_d=to_d)
+
+    if not pts and (not (from_yyyymmdd and to_yyyymmdd)):
+        today = date.today()
+        for y in range(today.year, today.year - 9, -1):
+            pts = await data_client.get_track_points(typ_seq=typSeq, from_d=date(y, 1, 1), to_d=date(y, 12, 31))
+            if pts:
+                from_d, to_d = date(y, 1, 1), date(y, 12, 31)
+                break
+
+    return {
+        "ok": True,
+        "typSeq": typSeq,
+        "range": {"from": str(from_d), "to": str(to_d)},
+        "count": len(pts),
+        "points": pts,
+        "disclaimer": "공공데이터포털 태풍 통보문 기반 포인트입니다(베스트트랙과 다를 수 있음).",
+    }
 
 
-@app.post("/mcp")
-@app.post("/mcp/")
-async def mcp_post(request: Request):
-    return await _handle_jsonrpc(request)
+@mcp.prompt()
+def typhoon_action_guide_system_prompt() -> str:
+    return """태풍 대응 행동 가이드 MCP: 시스템 프롬프트는 prompts/system_prompt.txt 파일을 참고하세요."""
 
 
-# 루트 POST로도 받기(클라이언트 변형 대비)
-@app.post("/")
-async def root_post(request: Request):
-    return await _handle_jsonrpc(request)
+# -------------------------
+# ASGI app
+# -------------------------
+def create_app() -> FastAPI:
+    # FastMCP 스트리머블 HTTP 마운트
+    app = FastAPI(lifespan=lambda app: mcp.session_manager.run(), title="Typhoon Action Guide MCP")
+    app.mount("/mcp", mcp.streamable_http_app())
+
+    @app.get("/health")
+    def health() -> Dict[str, str]:
+        return {"status": "ok"}
+
+    return app
+
+
+app = create_app()
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
-        "src.server:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "10000")),
-        reload=False,
-    )
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("src.server:app", host="0.0.0.0", port=port, reload=False)
