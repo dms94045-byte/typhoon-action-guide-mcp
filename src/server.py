@@ -280,23 +280,42 @@ async def tool_search_past_typhoons(args: Dict[str, Any]) -> Dict[str, Any]:
 
     client = _get_data_client()
     today = date.today()
-    years = [int(year)] if year is not None else list(range(today.year, max(today.year - 9, 1950), -1))
 
-    matches: List[Dict[str, Any]] = []
-    for y in years[:10]:
+    # ✅ year를 주면 해당 연도만 정확히
+    if year is not None:
+        y = int(year)
         typhoons = await client.list_unique_typhoons_in_range(date(y, 1, 1), date(y, 12, 31))
+        matches = []
         for t in typhoons:
             name_kr = str(t.get("typName", ""))
             name_en = str(t.get("typEn", ""))
-            if query:
-                if (query in name_kr) or (query.lower() in name_en.lower()):
-                    matches.append(t)
-            else:
+            if (query in name_kr) or (query.lower() in name_en.lower()):
                 matches.append(t)
-        if matches and year is None:
+        return {"content": [_text_content(json.dumps({"ok": True, "year": y, "results": matches[:30]}, ensure_ascii=False, indent=2))]}
+
+    # ✅ year가 없으면: 최근 10년만 보지 말고, 오래된 태풍도 찾도록 과거로 확장
+    # 너무 과도한 호출을 막기 위해 "최대 70년 전"까지만 (필요하면 숫자 늘려도 됨)
+    max_years_back = int(os.getenv("PAST_TY_SEARCH_MAX_YEARS_BACK", "70"))
+    start_year = today.year
+    end_year = max(today.year - max_years_back, 1950)
+
+    all_matches: List[Dict[str, Any]] = []
+    for y in range(start_year, end_year - 1, -1):
+        typhoons = await client.list_unique_typhoons_in_range(date(y, 1, 1), date(y, 12, 31))
+        matches = []
+        for t in typhoons:
+            name_kr = str(t.get("typName", ""))
+            name_en = str(t.get("typEn", ""))
+            if (query in name_kr) or (query.lower() in name_en.lower()):
+                matches.append(t)
+
+        if matches:
+            # ✅ 찾는 즉시 반환 (가장 최신 연도부터 내려가므로, 보통 여기서 끝남)
+            all_matches.extend(matches)
             break
 
-    return {"content": [_text_content(json.dumps({"ok": True, "results": matches[:20]}, ensure_ascii=False, indent=2))]}
+    return {"content": [_text_content(json.dumps({"ok": True, "query": query, "results": all_matches[:30]}, ensure_ascii=False, indent=2))]}
+
 
 
 async def tool_get_past_typhoon_track(args: Dict[str, Any]) -> Dict[str, Any]:
